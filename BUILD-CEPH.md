@@ -98,6 +98,7 @@ cd /root/ceph
 | `--rpm-version VERSION` | RPM 版本号，默认 `21.3.0`。可写成 `21.3.0-1`（`-` 后为 release），也支持环境变量 `RPM_VERSION` |
 | `--clean` | 启动前删除 `build/`（以及非纯二进制模式下的 `build-rpms/`） |
 | `--skip-deps` | 跳过依赖安装 |
+| `--skip-submodules` | 跳过 git 子模块自动下载 |
 | `--jobs N` | 并行编译任务数，默认 `nproc` |
 | `--build-type TYPE` | CMake 构建类型，默认 `RelWithDebInfo` |
 | `--with-tests` | 编译单元测试（默认关闭，且不再联网拉取 Catch2） |
@@ -109,8 +110,11 @@ cd /root/ceph
 ```
 REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
 BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
-WITH_TESTS WITH_PARQUET
+WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
 ```
+
+`SYNC_SUBMODULES=0` 等价于 `--skip-submodules`；`SUBMODULE_JOBS` 是
+子模块并行下载数（默认 8）。
 
 其中 `REMOTE_PASS` 必填；脚本不会在命令行参数里接受密码。
 
@@ -126,14 +130,20 @@ REMOTE_HOST=10.0.0.5 REMOTE_USER=ops REMOTE_PASS=secret ./build-ceph.sh --rpm
 
 1. **启动代理**：若本机 1080 端口没有可用 SOCKS5 代理，就用 `sshpass + ssh -D`
    在远端主机上开一个动态转发端口，退出时自动关闭；已有可用代理则直接复用。
-2. **安装依赖**：openEuler 上用 `dnf builddep` 解析 `ceph.spec.in` 安装依赖；
+2. **自动下载子模块**：检测 `git submodule status --recursive` 中未初始化的
+   子模块（rocksdb、zstd、arrow、isa-l 等），然后执行
+   `git submodule sync/update --init --recursive`。git 走上面的 SOCKS5 隧道，
+   即由 `43.163.78.103` 访问 GitHub 并把对象经 SSH 隧道回传到运行脚本的
+   构建机（如 `192.168.1.3`），本机无需直连外网。已初始化的子模块直接跳过；
+   `--skip-submodules` 可关闭此步骤。
+3. **安装依赖**：openEuler 上用 `dnf builddep` 解析 `ceph.spec.in` 安装依赖；
    `libnbd-devel` 在 openEuler 源里没有，脚本会在远端（CentOS Stream 9）
    执行 `dnf download --resolve` 再 `scp` 回来安装。
-3. **二进制模式**：
+4. **二进制模式**：
    - 准备 cephadm 的离线 wheelhouse（`.cache/cephadm-wheelhouse/`），
      避免临时 venv 中的 pip 无法走 SOCKS 代理；
    - `cmake -GNinja` 配置，`ninja` 编译。
-4. **RPM 模式**：
+5. **RPM 模式**：
    - 用仓库自带 `make-dist` 生成 `ceph-<版本>.tar.bz2`：
      - 通过一个 `wget -> curl` 的 shim 走代理下载 boost / liburing / pmdk；
      - 通过补丁副本跳过 Dashboard 前端 npm 构建（spec 本身以
@@ -188,6 +198,7 @@ dnf install ./build-rpms/RPMS/x86_64/*.rpm
 
 ```
 [2026-11-12 23:18:32] 构建完成，耗时统计
+  子模块   : 3m05s      (  4.6%)
   依赖安装 : 8m12s      ( 12.5%)
   配置     : 1m40s      (  2.5%)
   编译     : 52m03s     ( 79.0%)
@@ -196,6 +207,7 @@ dnf install ./build-rpms/RPMS/x86_64/*.rpm
   总计     : 1h05m50s   (100.0%)
 ```
 
+“子模块”行只在本次确实下载了子模块（耗时大于 0）时显示；
 纯二进制模式不显示“打包”行，纯 RPM 模式不显示“配置/编译”行，
 “依赖安装”用 `--skip-deps` 跳过时显示 `0s`。
 
@@ -226,6 +238,13 @@ PROXY_PORT=1081 ./build-ceph.sh
 ```
 
 如果端口被别的程序占用且不是可用代理，脚本会直接报错退出。
+
+**子模块下载失败 / 中断**
+
+脚本只处理 `git submodule status --recursive` 中前缀为 `-` 的子模块，
+失败会直接退出；重跑同一条命令会从断点继续。若某个子模块残留半成品目录，
+确认其中没有本地改动后可先 `git submodule deinit -f <路径>` 再重跑。
+临时跳过：`--skip-submodules`（需要子模块已就位，否则编译会失败）。
 
 **依赖下载很慢**
 

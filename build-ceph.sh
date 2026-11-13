@@ -7,8 +7,11 @@
 #   --both      compile native binaries, then build RPM packages
 #
 # All dependency downloads go through the remote host below, used as an
-# SSH SOCKS5 proxy. If the remote host lacks a package that openEuler does
-# not ship (libnbd-devel), it is downloaded on the remote and copied back.
+# SSH SOCKS5 proxy. Git submodules are fetched the same way: the remote
+# host resolves and downloads them, and they are delivered back to this
+# build host over the SSH tunnel (no direct internet access needed).
+# If the remote host lacks a package that openEuler does not ship
+# (libnbd-devel), it is downloaded on the remote and copied back.
 #
 # Usage:
 #   ./build-ceph.sh [options]
@@ -19,6 +22,7 @@
 #   --rpm-version VERSION Version used by the RPM spec (default: 21.3.0)
 #   --clean               Remove build/ and build-rpms/ before starting
 #   --skip-deps           Do not install build dependencies
+#   --skip-submodules     Do not fetch git submodules
 #   --jobs N              Parallel build jobs (default: nproc)
 #   --build-type TYPE     CMake build type (default: RelWithDebInfo)
 #   --with-tests          Build unit tests (default: off)
@@ -28,7 +32,7 @@
 # Environment overrides:
 #   REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
 #   BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
-#   WITH_TESTS WITH_PARQUET
+#   WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +47,8 @@ BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
 JOBS=${JOBS:-$(nproc)}
 WITH_TESTS=${WITH_TESTS:-OFF}
 WITH_PARQUET=${WITH_PARQUET:-OFF}
+SYNC_SUBMODULES=${SYNC_SUBMODULES:-1}
+SUBMODULE_JOBS=${SUBMODULE_JOBS:-8}
 LOG_DIR=${LOG_DIR:-${SCRIPT_DIR}/build-logs}
 BUILD_MODE=binary
 SKIP_DEPS=0
@@ -68,6 +74,7 @@ Options:
   --rpm-version VERSION  Version used by the RPM spec (default: 21.3.0)
   --clean                Remove build/ and build-rpms/ before starting
   --skip-deps            Do not install build dependencies
+  --skip-submodules      Do not fetch git submodules
   --jobs N               Parallel build jobs (default: nproc)
   --build-type TYPE      CMake build type (default: RelWithDebInfo)
   --with-tests           Build unit tests (default: off)
@@ -77,7 +84,7 @@ Options:
 Environment overrides:
   REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
   BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
-  WITH_TESTS WITH_PARQUET
+  WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
 
 Outputs:
   binaries : build/bin
@@ -124,6 +131,7 @@ while [ $# -gt 0 ]; do
         --rpm-version) RPM_VERSION=$2; shift ;;
         --clean) CLEAN=1 ;;
         --skip-deps) SKIP_DEPS=1 ;;
+        --skip-submodules) SYNC_SUBMODULES=0 ;;
         --jobs) JOBS=$2; shift ;;
         --build-type) BUILD_TYPE=$2; shift ;;
         --with-tests) WITH_TESTS=ON ;;
@@ -138,6 +146,7 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/build-$(date '+%Y%m%d-%H%M%S').log"
 SCRIPT_START=$(date +%s)
 DEPS_SECONDS=0
+SUBMODULE_SECONDS=0
 CONFIGURE_SECONDS=0
 BUILD_SECONDS=0
 RPM_SECONDS=0
@@ -212,6 +221,48 @@ ensure_libnbd() {
     sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
         "rm -rf '${remote_dir}'"
     rm -rf "$local_dir"
+}
+
+sync_submodules() {
+    # Git submodules (rocksdb, zstd, arrow, isa-l, ...) are cloned by the
+    # remote host's network: git is pointed at the SOCKS5 tunnel, so the
+    # objects are fetched through REMOTE_HOST and delivered here.
+    [ "$SYNC_SUBMODULES" -eq 1 ] || { log "Skipping submodule sync"; return; }
+    [ -d "${SCRIPT_DIR}/.git" ] || { log "Not a git checkout, skipping submodules"; return; }
+
+    local status
+    status=$(git -C "$SCRIPT_DIR" submodule status --recursive 2>/dev/null || true)
+    if [ -z "$status" ]; then
+        log "No git submodules defined"
+        return
+    fi
+    if ! grep -q '^-' <<< "$status"; then
+        log "Git submodules already initialized"
+        return
+    fi
+
+    log "Fetching git submodules via ${REMOTE_HOST} (SOCKS5 127.0.0.1:${PROXY_PORT}), delivering to this host"
+    git -C "$SCRIPT_DIR" submodule sync --recursive >/dev/null
+
+    # Only touch missing submodules; initialized (possibly modified) ones
+    # are left alone.
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        log "  -> ${path}"
+        GIT_TERMINAL_PROMPT=0 \
+            git -C "$SCRIPT_DIR" -c "submodule.fetchJobs=${SUBMODULE_JOBS}" \
+            submodule update --init --recursive --progress -- "$path" \
+            || die "git submodule update failed for ${path} (check proxy ${REMOTE_HOST})"
+    done < <(printf '%s\n' "$status" \
+             | sed -n 's/^-[0-9a-f]* //p' \
+             | sed 's/ (.*)$//')
+
+    status=$(git -C "$SCRIPT_DIR" submodule status --recursive 2>/dev/null || true)
+    if grep -q '^-' <<< "$status"; then
+        die "some submodules are still missing"
+    fi
+    log "Git submodules are ready"
 }
 
 install_deps() {
@@ -398,6 +449,9 @@ summary() {
         log "RPM output: $(find "${RPM_TOP}/RPMS" -name '*.rpm' | wc -l) packages in ${RPM_TOP}/RPMS"
     fi
     log "构建完成，耗时统计"
+    if [ "$SUBMODULE_SECONDS" -gt 0 ]; then
+        printf '  子模块   : %-9s %s\n' "$(format_duration "$SUBMODULE_SECONDS")" "$(format_percent "$SUBMODULE_SECONDS" "$total")"
+    fi
     printf '  依赖安装 : %-9s %s\n' "$(format_duration "$DEPS_SECONDS")" "$(format_percent "$DEPS_SECONDS" "$total")"
     if [ "$BUILD_MODE" != "rpm" ]; then
         printf '  配置     : %-9s %s\n' "$(format_duration "$CONFIGURE_SECONDS")" "$(format_percent "$CONFIGURE_SECONDS" "$total")"
@@ -418,6 +472,15 @@ start_proxy
 export http_proxy="socks5h://127.0.0.1:${PROXY_PORT}"
 export https_proxy="$http_proxy"
 export all_proxy="$http_proxy"
+
+if [ "$SYNC_SUBMODULES" -eq 1 ]; then
+    phase_start=$(date +%s)
+    sync_submodules
+    SUBMODULE_SECONDS=$(( $(date +%s) - phase_start ))
+    log "Submodule sync took $(format_duration "$SUBMODULE_SECONDS")"
+else
+    log "Skipping submodule sync"
+fi
 
 if [ "$SKIP_DEPS" -eq 0 ]; then
     phase_start=$(date +%s)
