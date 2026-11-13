@@ -44,16 +44,20 @@ export REMOTE_PASS='你的密码'
 ```
 
 ```bash
-# 方式二：本地覆盖文件（推荐，脚本会自动 source，不纳入 git）
-cat > .build-ceph.local <<'EOF'
-REMOTE_HOST=43.163.78.103
-REMOTE_USER=root
-REMOTE_PASS='你的密码'
-EOF
+# 方式二：本地覆盖文件（脚本会自动 source）
+# 仓库自带注释好的模板，取消注释并填入自己的值即可
+vi .build-ceph.local
 chmod 600 .build-ceph.local
 ```
 
-`.build-ceph.local` 已加入 `.gitignore`，只会留在本机。
+`.build-ceph.local` 作为配置模板纳入仓库，但只包含注释，不含真实凭据。
+本地填入真实密码后，可用下面的命令让 git 忽略该文件的改动：
+
+```bash
+git update-index --skip-worktree .build-ceph.local
+```
+
+或者只在使用时通过 `REMOTE_PASS` 环境变量传入，不修改文件。
 
 ## 3. 快速开始
 
