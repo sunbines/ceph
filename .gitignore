@@ -84,6 +84,11 @@ GTAGS
 /src/python-common/build/
 .cache
 
+# Local build overrides (may contain credentials)
+.build-ceph.local
+build-logs/
+build-rpms/
+
 # Doc build output
 src/pybind/cephfs/build/
 src/pybind/cephfs/cephfs.c
