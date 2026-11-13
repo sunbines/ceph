@@ -1,0 +1,23 @@
+# Ceph 构建配置模板。
+# 脚本默认读取同目录下的 .build-ceph.toml，可用 CONFIG_FILE 指定其他路径。
+# 优先级：命令行参数 > 环境变量 > 本文件 > 脚本默认值。
+#
+# 不要把真实密码提交到仓库：建议用环境变量 REMOTE_PASS 传入，
+# 或本地填写后执行：git update-index --skip-worktree .build-ceph.toml
+
+[remote]
+host = "43.163.78.103"
+user = "root"
+port = 1080
+# password = "your-password"
+
+[build]
+# jobs = 12                 # 默认使用 nproc
+build_type = "RelWithDebInfo"
+tests = false
+parquet = false
+sync_submodules = true
+submodule_jobs = 8
+
+[rpm]
+version = "21.3.0"

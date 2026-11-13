@@ -33,6 +33,11 @@
 #   REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
 #   BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
 #   WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
+#   CONFIG_FILE
+#
+# Configuration file (TOML, optional):
+#   .build-ceph.toml next to this script. Environment variables take
+#   precedence over it; command-line options take precedence over both.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,16 +55,11 @@ WITH_PARQUET=${WITH_PARQUET:-OFF}
 SYNC_SUBMODULES=${SYNC_SUBMODULES:-1}
 SUBMODULE_JOBS=${SUBMODULE_JOBS:-8}
 LOG_DIR=${LOG_DIR:-${SCRIPT_DIR}/build-logs}
+CONFIG_FILE=${CONFIG_FILE:-${SCRIPT_DIR}/.build-ceph.toml}
 BUILD_MODE=binary
 SKIP_DEPS=0
 CLEAN=0
 PROXY_PID=""
-
-# Local overrides (contains credentials, not committed).
-if [ -f "${SCRIPT_DIR}/.build-ceph.local" ]; then
-    # shellcheck disable=SC1091
-    . "${SCRIPT_DIR}/.build-ceph.local"
-fi
 
 usage() {
     cat <<'EOF'
@@ -85,6 +85,9 @@ Environment overrides:
   REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
   BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
   WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
+  CONFIG_FILE (default: .build-ceph.toml)
+
+Precedence: command line > environment > .build-ceph.toml > defaults
 
 Outputs:
   binaries : build/bin
@@ -123,6 +126,55 @@ die() {
     log "ERROR: $*"
     exit 1
 }
+
+load_config() {
+    local cfg=${CONFIG_FILE:-${SCRIPT_DIR}/.build-ceph.toml} assignments
+    [ -f "$cfg" ] || return 0
+
+    assignments=$(python3 - "$cfg" <<'PY'
+import os
+import shlex
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit("python3 >= 3.11 (tomllib) is required for TOML config")
+
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+
+entries = [
+    (("remote", "host"), "REMOTE_HOST", str),
+    (("remote", "user"), "REMOTE_USER", str),
+    (("remote", "password"), "REMOTE_PASS", str),
+    (("remote", "port"), "PROXY_PORT", str),
+    (("build", "jobs"), "JOBS", str),
+    (("build", "build_type"), "BUILD_TYPE", str),
+    (("build", "tests"), "WITH_TESTS", lambda v: "ON" if v else "OFF"),
+    (("build", "parquet"), "WITH_PARQUET", lambda v: "ON" if v else "OFF"),
+    (("build", "sync_submodules"), "SYNC_SUBMODULES", lambda v: "1" if v else "0"),
+    (("build", "submodule_jobs"), "SUBMODULE_JOBS", str),
+    (("rpm", "version"), "RPM_VERSION", str),
+]
+
+for (section, key), env, conv in entries:
+    value = data.get(section, {}).get(key)
+    # Environment variables take precedence over the config file.
+    if value is None or env in os.environ:
+        continue
+    if isinstance(value, str) and value == "":
+        continue
+    print(f"{env}={shlex.quote(conv(value))}")
+PY
+) || die "failed to parse ${cfg}"
+
+    # Values are shlex-quoted by the parser above.
+    eval "$assignments"
+    log "Loaded config from ${cfg}"
+}
+
+load_config
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -183,7 +235,7 @@ start_proxy() {
         die "port ${PROXY_PORT} is in use but is not a working SOCKS5 proxy"
     fi
     [ -n "$REMOTE_PASS" ] \
-        || die "REMOTE_PASS is not set: export it or create ${SCRIPT_DIR}/.build-ceph.local"
+        || die "REMOTE_PASS is not set: export it or set [remote] password in ${CONFIG_FILE}"
     log "Starting SOCKS5 proxy 127.0.0.1:${PROXY_PORT} via ${REMOTE_USER}@${REMOTE_HOST}"
     sshpass -p "$REMOTE_PASS" ssh -D "127.0.0.1:${PROXY_PORT}" -N \
         "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" </dev/null \

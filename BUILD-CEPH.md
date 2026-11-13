@@ -38,26 +38,48 @@ dnf install -y rpm-build bzip2 git tar
 远端密码不写进脚本（避免提交到 git）。首次使用前二选一：
 
 ```bash
-# 方式一：环境变量
+# 方式一：环境变量（优先级最高）
 export REMOTE_PASS='你的密码'
 ./build-ceph.sh --rpm
 ```
 
 ```bash
-# 方式二：本地覆盖文件（脚本会自动 source）
-# 仓库自带注释好的模板，取消注释并填入自己的值即可
-vi .build-ceph.local
-chmod 600 .build-ceph.local
+# 方式二：TOML 配置文件
+# 仓库自带模板 .build-ceph.toml，按需修改即可
+vi .build-ceph.toml
+chmod 600 .build-ceph.toml
 ```
 
-`.build-ceph.local` 作为配置模板纳入仓库，但只包含注释，不含真实凭据。
-本地填入真实密码后，可用下面的命令让 git 忽略该文件的改动：
+TOML 模板结构（脚本用 python3 的 `tomllib` 解析，需 Python 3.11+）：
+
+```toml
+[remote]
+host = "43.163.78.103"
+user = "root"
+port = 1080
+password = "你的密码"      # 也可以不填，改用 REMOTE_PASS 环境变量
+
+[build]
+jobs = 12
+build_type = "RelWithDebInfo"
+tests = false
+parquet = false
+sync_submodules = true
+submodule_jobs = 8
+
+[rpm]
+version = "21.3.0"
+```
+
+优先级：**命令行参数 > 环境变量 > `.build-ceph.toml` > 脚本默认值**。
+仓库中的模板不含真实凭据；本地填入密码后，可用下面的命令让 git
+忽略该文件的改动：
 
 ```bash
-git update-index --skip-worktree .build-ceph.local
+git update-index --skip-worktree .build-ceph.toml
 ```
 
-或者只在使用时通过 `REMOTE_PASS` 环境变量传入，不修改文件。
+也可以用 `CONFIG_FILE=/path/to/other.toml` 指定其他配置文件。
 
 ## 3. 快速开始
 
@@ -109,7 +131,7 @@ cd /root/ceph
 | `--with-parquet` | 编译 RGW S3 Select parquet 支持（默认关闭，需内置 Arrow，编译很慢） |
 | `-h`, `--help` | 显示帮助 |
 
-环境变量覆盖（也可写进 `.build-ceph.local`）：
+环境变量覆盖（优先级高于 TOML 配置）：
 
 ```
 REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
