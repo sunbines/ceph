@@ -45,14 +45,15 @@ dnf install -y rpm-build bzip2 git tar
 ```bash
 # 方式一：环境变量（优先级最高）
 export REMOTE_PASS='你的密码'
-./build-ceph.sh --rpm
+./script/build-ceph.sh --rpm
 ```
 
 ```bash
 # 方式二：TOML 配置文件
-# 仓库自带模板 build-ceph.toml，按需修改即可
-vi build-ceph.toml
-chmod 600 build-ceph.toml
+# 仓库自带模板 conf/build-ceph.toml.example，复制后按需修改
+cp conf/build-ceph.toml.example conf/build-ceph.toml
+vi conf/build-ceph.toml
+chmod 600 conf/build-ceph.toml
 ```
 
 TOML 模板结构（脚本用 python3 的 `tomllib` 解析，需 Python 3.11+）：
@@ -76,13 +77,9 @@ submodule_jobs = 8
 version = "21.3.0"
 ```
 
-优先级：**命令行参数 > 环境变量 > `build-ceph.toml` > 脚本默认值**。
-仓库中的模板不含真实凭据；本地填入密码后，可用下面的命令让 git
-忽略该文件的改动：
-
-```bash
-git update-index --skip-worktree build-ceph.toml
-```
+优先级：**命令行参数 > 环境变量 > `conf/build-ceph.toml` > 脚本默认值**。
+仓库中的模板不含真实凭据；`conf/build-ceph.toml` 已被 `.gitignore` 忽略，
+本地填入的密码不会被提交。
 
 也可以用 `CONFIG_FILE=/path/to/other.toml` 指定其他配置文件。
 
@@ -94,25 +91,25 @@ git update-index --skip-worktree build-ceph.toml
 cd /root/ceph
 
 # 1) 只编译二进制
-./build-ceph.sh
+./script/build-ceph.sh
 
 # 2) 只打 RPM 包
-./build-ceph.sh --rpm
+./script/build-ceph.sh --rpm
 
 # 3) 二进制 + RPM
-./build-ceph.sh --both
+./script/build-ceph.sh --both
 
 # 4) 打 RPM 并直接安装（含运行时依赖）
-./build-ceph.sh --rpm --install-rpms
+./script/build-ceph.sh --rpm --install-rpms
 
 # 5) 安装之前已打好的 RPM
-./build-ceph.sh --install
+./script/build-ceph.sh --install
 
 # 6) 编译并安装二进制到 /usr/local（默认前缀）
-./build-ceph.sh --install-binaries
+./script/build-ceph.sh --install-binaries
 
 # 7) 指定安装前缀
-INSTALL_PREFIX=/opt/ceph ./build-ceph.sh --install-binaries
+INSTALL_PREFIX=/opt/ceph ./script/build-ceph.sh --install-binaries
 ```
 
 需要 root 权限（安装依赖、写系统目录），非 root 用户请用 `sudo`。
@@ -121,13 +118,13 @@ INSTALL_PREFIX=/opt/ceph ./build-ceph.sh --install-binaries
 
 ```bash
 # 依赖已装好时跳过依赖安装，节省时间
-./build-ceph.sh --skip-deps
+./script/build-ceph.sh --skip-deps
 
 # 全量重来：清掉 build/ 和 build-rpms/
-./build-ceph.sh --both --clean
+./script/build-ceph.sh --both --clean
 
 # 指定并行度和 RPM 版本
-./build-ceph.sh --rpm --jobs 16 --rpm-version 21.3.0-1
+./script/build-ceph.sh --rpm --jobs 16 --rpm-version 21.3.0-1
 ```
 
 ---
@@ -169,7 +166,7 @@ INSTALL_PREFIX
 例如换一台跳板机：
 
 ```bash
-REMOTE_HOST=10.0.0.5 REMOTE_USER=ops REMOTE_PASS=secret ./build-ceph.sh --rpm
+REMOTE_HOST=10.0.0.5 REMOTE_USER=ops REMOTE_PASS=secret ./script/build-ceph.sh --rpm
 ```
 
 ---
@@ -250,15 +247,15 @@ build/bin/rbd --version
 安装二进制：
 
 ```bash
-./build-ceph.sh --install-binaries                 # 默认装到 /usr/local
-INSTALL_PREFIX=/opt/ceph ./build-ceph.sh --install-binaries
+./script/build-ceph.sh --install-binaries                 # 默认装到 /usr/local
+INSTALL_PREFIX=/opt/ceph ./script/build-ceph.sh --install-binaries
 ```
 
 安装 RPM：
 
 ```bash
 # 推荐：脚本自动补齐运行时依赖（含 pip 安装 asyncssh）
-./build-ceph.sh --install
+./script/build-ceph.sh --install
 
 # 等价的手工步骤（先装依赖，再装包）
 dnf install -y luarocks python3-cherrypy python3-natsort python3-pyOpenSSL \
@@ -311,7 +308,7 @@ dnf install -y ./build-rpms/RPMS/x86_64/*.rpm
 
 **安装 RPM 时报缺少 python3-cherrypy / luarocks / resource-agents 等依赖**
 
-直接运行 `./build-ceph.sh --install`，脚本会用 `dnf` 安装这些运行时依赖，
+直接运行 `./script/build-ceph.sh --install`，脚本会用 `dnf` 安装这些运行时依赖，
 并用 pip 安装 openEuler 源里没有的 `python3-asyncssh`，然后再安装
 `build-rpms/RPMS/x86_64/*.rpm`。注意 `python3-asyncssh` 降级为
 `Recommends` 的 spec 修改只对本次构建生成的 RPM 生效；旧 RPM 请重新
@@ -327,7 +324,7 @@ dnf install -y ./build-rpms/RPMS/x86_64/*.rpm
 说明 `build-rpms/RPMS` 下同一版本包存在多份，常见于中断过的 RPM 重建
 （新包落在 `RPMS/noarch`，旧包仍留在 `RPMS/x86_64`）。`--install` 会按
 `name-version-release.arch` 去重，并优先使用修改时间最新的文件，日志中会
-打印忽略了几个重复文件。直接重跑 `./build-ceph.sh --install` 即可，
+打印忽略了几个重复文件。直接重跑 `./script/build-ceph.sh --install` 即可，
 不需要手工删包。
 
 **编译时报 `file STRINGS ... src/rocksdb/include/rocksdb/version.h cannot be read`**
@@ -341,7 +338,7 @@ dnf install -y ./build-rpms/RPMS/x86_64/*.rpm
 查看 `build-logs/ssh-proxy.log`；换端口：
 
 ```bash
-PROXY_PORT=1081 ./build-ceph.sh
+PROXY_PORT=1081 ./script/build-ceph.sh
 ```
 
 如果端口被别的程序占用且不是可用代理，脚本会直接报错退出。
@@ -377,12 +374,12 @@ CentOS Stream 9 仓库，或手动准备 RPM 后重跑。
 **想改版本号 / 重新生成 tarball**
 
 ```bash
-./build-ceph.sh --rpm --rpm-version 21.3.0-1 --clean
+./script/build-ceph.sh --rpm --rpm-version 21.3.0-1 --clean
 ```
 
 **只想重打包、复用已有 tarball**
 
-不加 `--clean` 直接 `./build-ceph.sh --rpm`，脚本会复用
+不加 `--clean` 直接 `./script/build-ceph.sh --rpm`，脚本会复用
 `build-rpms/SOURCES/ceph-<版本>.tar.bz2`。
 
 **磁盘不足**

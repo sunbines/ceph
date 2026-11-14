@@ -1,9 +1,9 @@
 # Ceph 构建配置模板。
-# 脚本默认读取同目录下的 .build-ceph.toml，可用 CONFIG_FILE 指定其他路径。
+# 复制为 conf/build-ceph.toml 后修改；脚本默认读取该文件，可用 CONFIG_FILE 指定其他路径。
 # 优先级：命令行参数 > 环境变量 > 本文件 > 脚本默认值。
 #
 # 不要把真实密码提交到仓库：建议用环境变量 REMOTE_PASS 传入，
-# 或本地填写后执行：git update-index --skip-worktree .build-ceph.toml
+# 或本地填写 conf/build-ceph.toml（该文件已被 .gitignore 忽略）。
 
 [remote]
 host = "43.163.78.103"

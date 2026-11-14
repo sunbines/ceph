@@ -14,7 +14,7 @@
 # (libnbd-devel), it is downloaded on the remote and copied back.
 #
 # Usage:
-#   ./build-ceph.sh [options]
+#   ./script/build-ceph.sh [options]
 #
 # Options:
 #   --rpm                 Build RPM packages instead of native binaries
@@ -36,17 +36,18 @@
 #   CONFIG_FILE
 #
 # Configuration file (TOML, optional):
-#   build-ceph.toml next to this script. Environment variables take
+#   conf/build-ceph.toml under the repo root. Environment variables take
 #   precedence over it; command-line options take precedence over both.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REMOTE_HOST=${REMOTE_HOST:-43.163.78.103}
 REMOTE_USER=${REMOTE_USER:-root}
 REMOTE_PASS=${REMOTE_PASS:-}
 PROXY_PORT=${PROXY_PORT:-1080}
-BUILD_DIR=${BUILD_DIR:-${SCRIPT_DIR}/build}
-RPM_TOP=${RPM_TOP:-${SCRIPT_DIR}/build-rpms}
+BUILD_DIR=${BUILD_DIR:-${REPO_ROOT}/build}
+RPM_TOP=${RPM_TOP:-${REPO_ROOT}/build-rpms}
 RPM_VERSION=${RPM_VERSION:-21.3.0}
 BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
 JOBS=${JOBS:-$(nproc)}
@@ -54,8 +55,8 @@ WITH_TESTS=${WITH_TESTS:-OFF}
 WITH_PARQUET=${WITH_PARQUET:-OFF}
 SYNC_SUBMODULES=${SYNC_SUBMODULES:-1}
 SUBMODULE_JOBS=${SUBMODULE_JOBS:-8}
-LOG_DIR=${LOG_DIR:-${SCRIPT_DIR}/build-logs}
-CONFIG_FILE=${CONFIG_FILE:-${SCRIPT_DIR}/build-ceph.toml}
+LOG_DIR=${LOG_DIR:-${REPO_ROOT}/build-logs}
+CONFIG_FILE=${CONFIG_FILE:-${REPO_ROOT}/conf/build-ceph.toml}
 INSTALL_PREFIX=${INSTALL_PREFIX:-/usr/local}
 BUILD_MODE=binary
 SKIP_DEPS=0
@@ -75,7 +76,7 @@ RUNTIME_DEPS=(
 
 usage() {
     cat <<'EOF'
-Usage: ./build-ceph.sh [options]
+Usage: ./script/build-ceph.sh [options]
 
 Modes:
   (default)              Compile native binaries with cmake/ninja
@@ -101,10 +102,10 @@ Environment overrides:
   REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
   BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
   WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
-  CONFIG_FILE (default: build-ceph.toml)
+  CONFIG_FILE (default: conf/build-ceph.toml)
   INSTALL_PREFIX (default: /usr/local)
 
-Precedence: command line > environment > build-ceph.toml > defaults
+Precedence: command line > environment > conf/build-ceph.toml > defaults
 
 Outputs:
   binaries : build/bin (install with --install-binaries)
@@ -145,7 +146,7 @@ die() {
 }
 
 load_config() {
-    local cfg=${CONFIG_FILE:-${SCRIPT_DIR}/build-ceph.toml} assignments
+    local cfg=${CONFIG_FILE:-${REPO_ROOT}/conf/build-ceph.toml} assignments
     [ -f "$cfg" ] || return 0
 
     assignments=$(python3 - "$cfg" <<'PY'
@@ -311,11 +312,11 @@ repair_submodules() {
     local path
     while IFS= read -r path; do
         [ -n "$path" ] || continue
-        [ -n "$(git -C "${SCRIPT_DIR}/${path}" ls-files -d 2>/dev/null)" ] || continue
+        [ -n "$(git -C "${REPO_ROOT}/${path}" ls-files -d 2>/dev/null)" ] || continue
         log "  repairing ${path}: restoring missing tracked files"
-        git -C "${SCRIPT_DIR}/${path}" ls-files -d -z \
-            | xargs -0 -r git -C "${SCRIPT_DIR}/${path}" checkout --
-    done < <(git -C "$SCRIPT_DIR" submodule status --recursive 2>/dev/null \
+        git -C "${REPO_ROOT}/${path}" ls-files -d -z \
+            | xargs -0 -r git -C "${REPO_ROOT}/${path}" checkout --
+    done < <(git -C "$REPO_ROOT" submodule status --recursive 2>/dev/null \
              | sed -n 's/^[ +][0-9a-f]* //p' | sed 's/ (.*)$//')
 }
 
@@ -324,10 +325,10 @@ sync_submodules() {
     # remote host's network: git is pointed at the SOCKS5 tunnel, so the
     # objects are fetched through REMOTE_HOST and delivered here.
     [ "$SYNC_SUBMODULES" -eq 1 ] || { log "Skipping submodule sync"; return; }
-    [ -d "${SCRIPT_DIR}/.git" ] || { log "Not a git checkout, skipping submodules"; return; }
+    [ -d "${REPO_ROOT}/.git" ] || { log "Not a git checkout, skipping submodules"; return; }
 
     local status
-    status=$(git -C "$SCRIPT_DIR" submodule status --recursive 2>/dev/null || true)
+    status=$(git -C "$REPO_ROOT" submodule status --recursive 2>/dev/null || true)
     if [ -z "$status" ]; then
         log "No git submodules defined"
         return
@@ -339,7 +340,7 @@ sync_submodules() {
     fi
 
     log "Fetching git submodules via ${REMOTE_HOST} (SOCKS5 127.0.0.1:${PROXY_PORT}), delivering to this host"
-    git -C "$SCRIPT_DIR" submodule sync --recursive >/dev/null
+    git -C "$REPO_ROOT" submodule sync --recursive >/dev/null
 
     # Only touch missing submodules; initialized (possibly modified) ones
     # are left alone.
@@ -348,14 +349,14 @@ sync_submodules() {
         [ -n "$path" ] || continue
         log "  -> ${path}"
         GIT_TERMINAL_PROMPT=0 \
-            git -C "$SCRIPT_DIR" -c "submodule.fetchJobs=${SUBMODULE_JOBS}" \
+            git -C "$REPO_ROOT" -c "submodule.fetchJobs=${SUBMODULE_JOBS}" \
             submodule update --init --recursive --progress -- "$path" \
             || die "git submodule update failed for ${path} (check proxy ${REMOTE_HOST})"
     done < <(printf '%s\n' "$status" \
              | sed -n 's/^-[0-9a-f]* //p' \
              | sed 's/ (.*)$//')
 
-    status=$(git -C "$SCRIPT_DIR" submodule status --recursive 2>/dev/null || true)
+    status=$(git -C "$REPO_ROOT" submodule status --recursive 2>/dev/null || true)
     if grep -q '^-' <<< "$status"; then
         die "some submodules are still missing"
     fi
@@ -369,7 +370,7 @@ install_deps() {
     if [ "$(rpm --eval '%{?openEuler}')" = "2" ]; then
         log "Installing build dependencies for openEuler via proxy"
         local spec="${LOG_DIR}/ceph-builddeps.spec"
-        sed -e 's/@//g' "${SCRIPT_DIR}/ceph.spec.in" \
+        sed -e 's/@//g' "${REPO_ROOT}/ceph.spec.in" \
             | sed -e 's/^%bcond_without crimson/%bcond_with crimson/' \
                   -e 's/^BuildRequires:\tgcc-c++ >= 13.3/BuildRequires:\tgcc-c++/' \
             > "$spec"
@@ -379,7 +380,7 @@ install_deps() {
         dnf_proxy -y builddep "$spec"
     else
         log "Non-openEuler distro detected, delegating to install-deps.sh"
-        ( cd "$SCRIPT_DIR" \
+        ( cd "$REPO_ROOT" \
             && export http_proxy="socks5h://127.0.0.1:${PROXY_PORT}" \
             && export https_proxy="$http_proxy" \
             && export all_proxy="$http_proxy" \
@@ -454,7 +455,7 @@ prepare_cephadm_wheelhouse() {
     # cephadm bundles Jinja2/MarkupSafe/PyYAML with pip, but pip in its
     # temporary venv cannot use a SOCKS proxy. Pre-download the packages
     # through the proxy and let the build install them offline.
-    local wh="${SCRIPT_DIR}/.cache/cephadm-wheelhouse" pat missing=0
+    local wh="${REPO_ROOT}/.cache/cephadm-wheelhouse" pat missing=0
     mkdir -p "$wh"
     for pat in 'pip-*.whl' 'jinja2-*.tar.gz' 'MarkupSafe-2.1*.tar.gz' \
                'pyyaml-*cp311*.whl' 'setuptools-*.tar.gz' 'wheel-*.tar.gz' \
@@ -482,7 +483,7 @@ configure() {
     cxx=${CXX:-$(command -v g++)}
     [ "$WITH_TESTS" = "ON" ] && catch2=ON
     log "Configuring Ceph: build type=${BUILD_TYPE}, jobs=${JOBS}, python=${pyver}"
-    cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -GNinja \
+    cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -GNinja \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
         -DCMAKE_C_COMPILER="$cc" \
@@ -543,11 +544,11 @@ WGET_EOF
         # builds with WITH_MGR_DASHBOARD_FRONTEND=OFF, so skip that step.
         sed -e 's/^build_dashboard_frontend$/:/' \
             -e '/^[[:space:]]*dashboard_frontend \\$/d' \
-            "${SCRIPT_DIR}/make-dist" > "$make_dist"
+            "${REPO_ROOT}/make-dist" > "$make_dist"
         chmod +x "$make_dist"
 
-        ( cd "$SCRIPT_DIR" && PATH="${shim}:$PATH" "$make_dist" "$RPM_VERSION" )
-        mv "${SCRIPT_DIR}/${tarball_name}" "${RPM_TOP}/SOURCES/"
+        ( cd "$REPO_ROOT" && PATH="${shim}:$PATH" "$make_dist" "$RPM_VERSION" )
+        mv "${REPO_ROOT}/${tarball_name}" "${RPM_TOP}/SOURCES/"
     else
         log "Reusing ${RPM_TOP}/SOURCES/${tarball_name}"
     fi
@@ -556,7 +557,7 @@ WGET_EOF
     sed -e "s/@PROJECT_VERSION@/${rpm_version}/g" \
         -e "s/@RPM_RELEASE@/${rpm_release}/g" \
         -e "s/@TARBALL_BASENAME@/ceph-${RPM_VERSION}/g" \
-        "${SCRIPT_DIR}/ceph.spec.in" > "$spec"
+        "${REPO_ROOT}/ceph.spec.in" > "$spec"
     # openEuler ships GCC 12; the 13.3 floor only matters for LTO builds.
     sed -i 's/^BuildRequires:\tgcc-c++ >= 13.3/BuildRequires:\tgcc-c++/' "$spec"
     # Avoid building the bundled Arrow copy; parquet S3 Select is optional,
@@ -640,7 +641,7 @@ summary() {
     log "Full log: ${LOG_FILE}"
 }
 
-log "Ceph build started from ${SCRIPT_DIR} (mode: ${BUILD_MODE})"
+log "Ceph build started from ${REPO_ROOT} (mode: ${BUILD_MODE})"
 log "Dependencies will be downloaded through ${REMOTE_USER}@${REMOTE_HOST}"
 
 start_proxy

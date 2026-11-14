@@ -87,6 +87,9 @@ GTAGS
 # Local build outputs
 build-logs/
 build-rpms/
+/conf/build-ceph.toml
+/conf/*.state.json
+/conf/*.local.toml
 
 # Doc build output
 src/pybind/cephfs/build/

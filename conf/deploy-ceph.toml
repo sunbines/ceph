@@ -1,0 +1,37 @@
+# deploy-ceph.py 配置示例：单节点集群
+# 先改成本机实际地址 / 磁盘，在仓库根目录执行：
+#   ./script/deploy-ceph.py -c conf/deploy-ceph.toml            # 预演
+#   ./script/deploy-ceph.py -c conf/deploy-ceph.toml --check    # 预检查
+#   ./script/deploy-ceph.py -c conf/deploy-ceph.toml --apply    # 执行部署
+#   ./script/deploy-ceph.py -c conf/deploy-ceph.toml --destroy  # 销毁预演
+#   ./script/deploy-ceph.py -c conf/deploy-ceph.toml --destroy --apply  # 执行销毁
+
+[cluster]
+# fsid 留空会自动生成，并保存到 conf/deploy-ceph.state.json；重跑会复用
+# fsid = "7c8b0a79-5bcd-42e0-aca2-e7c193ab9a78"
+public_network = "192.168.1.0/24"
+cluster_network = "192.168.1.0/24"
+pool_size = 2
+pool_min_size = 1
+pg_num = 64
+# 新盘/可清空的盘可设为 true，脚本会在建 OSD 前执行 wipefs -a
+wipe_devices = false
+rgw_realm = "default"
+
+[[node]]
+name = "openeuler2403"
+address = "192.168.1.10"
+ssh_user = "root"
+ssh_port = 22
+mon = true
+mgr = true
+rgw = true
+rgw_port = 7480
+# 方式一：已分好区的磁盘，直接列分区
+osd_devices = ["/dev/sda1", "/dev/sda2", "/dev/sda3", "/dev/sda4"]
+
+# 方式二：让脚本把整盘自动分成 4 个区（会清空该盘！）
+# 使用方式二时请注释掉上面的 osd_devices，二者只能选一个。
+# [node.partition]
+# disk = "/dev/sda"
+# count = 4

@@ -1,0 +1,49 @@
+# deploy-ceph.py 配置示例：多节点集群（3 mon + 2 mgr + 1 rgw + 每节点 2 osd）
+#
+# 前提：
+#   1. 所有节点都已安装同版本的 Ceph RPM；
+#   2. 运行脚本的机器（admin 节点）到所有节点的 root SSH 免密登录已配置：
+#        ssh-copy-id root@10.0.0.11
+#   3. 每台机器的 osd 磁盘都是专用盘，不需要保留数据。
+#
+# 运行（在仓库根目录，admin 节点上）：
+#   ./script/deploy-ceph.py -c conf/deploy-ceph-multi.toml --check
+#   ./script/deploy-ceph.py -c conf/deploy-ceph-multi.toml --apply
+#   ./script/deploy-ceph.py -c conf/deploy-ceph-multi.toml --destroy --check
+#   ./script/deploy-ceph.py -c conf/deploy-ceph-multi.toml --destroy --apply
+
+[cluster]
+public_network = "10.0.0.0/24"
+cluster_network = "10.0.0.0/24"
+pool_size = 2
+pool_min_size = 1
+pg_num = 64
+wipe_devices = true
+rgw_realm = "default"
+
+[[node]]
+name = "ceph1"
+address = "10.0.0.11"
+mon = true
+mgr = true
+osd_devices = ["/dev/sdb", "/dev/sdc"]
+
+[[node]]
+name = "ceph2"
+address = "10.0.0.12"
+mon = true
+mgr = true
+osd_devices = ["/dev/sdb", "/dev/sdc"]
+
+[[node]]
+name = "ceph3"
+address = "10.0.0.13"
+mon = true
+rgw = true
+rgw_port = 7480
+osd_devices = ["/dev/sdb", "/dev/sdc"]
+# 也可以让脚本自动分区（会清空 /dev/sdb）。
+# 使用自动分区时，请注释掉上面的 osd_devices，二者只能选一个：
+# [node.partition]
+# disk = "/dev/sdb"
+# count = 4
