@@ -416,10 +416,30 @@ install_asyncssh() {
 }
 
 install_rpms() {
-    local rpms=()
-    mapfile -t rpms < <(find "${RPM_TOP}/RPMS" -name '*.rpm' 2>/dev/null | sort)
+    local rpms=() found f nevra
+    local -A newest=()
+
+    # Interrupted rebuilds can leave two copies of the same NEVRA under
+    # different arch dirs (e.g. RPMS/x86_64 vs RPMS/noarch). dnf aborts with
+    # "cannot install both X from @commandline and X from @commandline"
+    # when that happens, so keep only the newest file per package.
+    found=$(find "${RPM_TOP}/RPMS" -name '*.rpm' 2>/dev/null | wc -l)
+    while IFS= read -r f; do
+        nevra=$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$f" 2>/dev/null) \
+            || { log "WARNING: skipping unreadable RPM ${f}"; continue; }
+        [ -n "$nevra" ] \
+            || { log "WARNING: skipping unreadable RPM ${f}"; continue; }
+        if [ -z "${newest[$nevra]:-}" ] || [ "$f" -nt "${newest[$nevra]}" ]; then
+            newest[$nevra]="$f"
+        fi
+    done < <(find "${RPM_TOP}/RPMS" -name '*.rpm' -print 2>/dev/null | sort)
+    mapfile -t rpms < <(printf '%s\n' "${newest[@]}" | sort)
+
     [ "${#rpms[@]}" -gt 0 ] \
         || die "no RPMs under ${RPM_TOP}/RPMS; build them with --rpm first"
+    if [ "$found" -gt "${#rpms[@]}" ]; then
+        log "Ignoring $((found - ${#rpms[@]})) duplicate RPM files (same name-version-release.arch)"
+    fi
 
     log "Installing runtime dependencies of the Ceph RPMs"
     dnf_proxy -y install "${RUNTIME_DEPS[@]}"
@@ -595,7 +615,7 @@ summary() {
         fi
     fi
     if [ "$BUILD_MODE" != "binary" ] && [ -d "${RPM_TOP}/RPMS" ]; then
-        log "RPM output: $(find "${RPM_TOP}/RPMS" -name '*.rpm' | wc -l) packages in ${RPM_TOP}/RPMS"
+        log "RPM output: $(find "${RPM_TOP}/RPMS" -name '*.rpm' | wc -l) RPM files in ${RPM_TOP}/RPMS"
     fi
     log "构建完成，耗时统计"
     if [ "$SUBMODULE_SECONDS" -gt 0 ]; then

@@ -322,6 +322,14 @@ dnf install -y ./build-rpms/RPMS/x86_64/*.rpm
 脚本会对 `build-logs/build.lock` 加 `flock`，第二个进程会直接报错退出。
 请等前一个任务结束（或确认没有 `build-ceph.sh`/`ninja` 进程）后再执行。
 
+**安装时提示 `cannot install both ... from @commandline`**
+
+说明 `build-rpms/RPMS` 下同一版本包存在多份，常见于中断过的 RPM 重建
+（新包落在 `RPMS/noarch`，旧包仍留在 `RPMS/x86_64`）。`--install` 会按
+`name-version-release.arch` 去重，并优先使用修改时间最新的文件，日志中会
+打印忽略了几个重复文件。直接重跑 `./build-ceph.sh --install` 即可，
+不需要手工删包。
+
 **编译时报 `file STRINGS ... src/rocksdb/include/rocksdb/version.h cannot be read`**
 
 说明 rocksdb 子模块目录被清空了。脚本启动时会自动检测并恢复缺失的
