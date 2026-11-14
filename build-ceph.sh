@@ -36,7 +36,7 @@
 #   CONFIG_FILE
 #
 # Configuration file (TOML, optional):
-#   .build-ceph.toml next to this script. Environment variables take
+#   build-ceph.toml next to this script. Environment variables take
 #   precedence over it; command-line options take precedence over both.
 set -euo pipefail
 
@@ -55,11 +55,23 @@ WITH_PARQUET=${WITH_PARQUET:-OFF}
 SYNC_SUBMODULES=${SYNC_SUBMODULES:-1}
 SUBMODULE_JOBS=${SUBMODULE_JOBS:-8}
 LOG_DIR=${LOG_DIR:-${SCRIPT_DIR}/build-logs}
-CONFIG_FILE=${CONFIG_FILE:-${SCRIPT_DIR}/.build-ceph.toml}
+CONFIG_FILE=${CONFIG_FILE:-${SCRIPT_DIR}/build-ceph.toml}
+INSTALL_PREFIX=${INSTALL_PREFIX:-/usr/local}
 BUILD_MODE=binary
 SKIP_DEPS=0
 CLEAN=0
+INSTALL_RPMS=0
+INSTALL_BINARIES=0
 PROXY_PID=""
+
+# Runtime dependencies of the built RPMs that openEuler does not pull in
+# automatically. python3-asyncssh is not packaged on openEuler and is
+# installed with pip instead (see install_asyncssh).
+RUNTIME_DEPS=(
+    luarocks python3-cherrypy python3-natsort python3-pyOpenSSL
+    python3-routes python3-numpy python3-scikit-learn python3-scipy
+    python3-kubernetes python3-jsonpatch resource-agents
+)
 
 usage() {
     cat <<'EOF'
@@ -69,9 +81,13 @@ Modes:
   (default)              Compile native binaries with cmake/ninja
   --rpm                  Build source tarball and RPM packages with rpmbuild
   --both                 Compile native binaries, then build RPM packages
+  --install              Install the already-built RPMs (no compilation)
 
 Options:
   --rpm-version VERSION  Version used by the RPM spec (default: 21.3.0)
+  --install-rpms         After building RPMs, install them and their runtime deps
+  --install-binaries     Compile (if needed), then cmake --install to INSTALL_PREFIX
+                         (alias: --install-bin)
   --clean                Remove build/ and build-rpms/ before starting
   --skip-deps            Do not install build dependencies
   --skip-submodules      Do not fetch git submodules
@@ -85,13 +101,14 @@ Environment overrides:
   REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
   BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
   WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
-  CONFIG_FILE (default: .build-ceph.toml)
+  CONFIG_FILE (default: build-ceph.toml)
+  INSTALL_PREFIX (default: /usr/local)
 
-Precedence: command line > environment > .build-ceph.toml > defaults
+Precedence: command line > environment > build-ceph.toml > defaults
 
 Outputs:
-  binaries : build/bin
-  rpm      : build-rpms/RPMS/<arch> and build-rpms/SRPMS
+  binaries : build/bin (install with --install-binaries)
+  rpm      : build-rpms/RPMS/<arch> and build-rpms/SRPMS (install with --install)
   logs     : build-logs/build-<timestamp>.log
 EOF
     exit 0
@@ -128,7 +145,7 @@ die() {
 }
 
 load_config() {
-    local cfg=${CONFIG_FILE:-${SCRIPT_DIR}/.build-ceph.toml} assignments
+    local cfg=${CONFIG_FILE:-${SCRIPT_DIR}/build-ceph.toml} assignments
     [ -f "$cfg" ] || return 0
 
     assignments=$(python3 - "$cfg" <<'PY'
@@ -180,6 +197,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --rpm) BUILD_MODE=rpm ;;
         --both) BUILD_MODE=both ;;
+        --install) INSTALL_RPMS=1 ;;
+        --install-rpms) INSTALL_RPMS=1 ;;
+        --install-binaries|--install-bin) INSTALL_BINARIES=1 ;;
         --rpm-version) RPM_VERSION=$2; shift ;;
         --clean) CLEAN=1 ;;
         --skip-deps) SKIP_DEPS=1 ;;
@@ -194,7 +214,15 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# --install alone means "install the RPMs built by an earlier run".
+if [ "$INSTALL_RPMS" -eq 1 ] && [ "$BUILD_MODE" = "binary" ]; then
+    BUILD_MODE=install
+fi
+
 mkdir -p "$LOG_DIR"
+# Concurrent runs share build/ and the proxy port; serialize them.
+exec 9>"${LOG_DIR}/build.lock"
+flock -n 9 || die "another build-ceph.sh run is already in progress"
 LOG_FILE="${LOG_DIR}/build-$(date '+%Y%m%d-%H%M%S').log"
 SCRIPT_START=$(date +%s)
 DEPS_SECONDS=0
@@ -202,6 +230,8 @@ SUBMODULE_SECONDS=0
 CONFIGURE_SECONDS=0
 BUILD_SECONDS=0
 RPM_SECONDS=0
+INSTALL_SECONDS=0
+INSTALL_BIN_SECONDS=0
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 SSH_OPTS=(
@@ -275,6 +305,20 @@ ensure_libnbd() {
     rm -rf "$local_dir"
 }
 
+repair_submodules() {
+    # A submodule can look initialized yet have an empty worktree (e.g. an
+    # interrupted checkout). Restore only missing tracked files from HEAD.
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        [ -n "$(git -C "${SCRIPT_DIR}/${path}" ls-files -d 2>/dev/null)" ] || continue
+        log "  repairing ${path}: restoring missing tracked files"
+        git -C "${SCRIPT_DIR}/${path}" ls-files -d -z \
+            | xargs -0 -r git -C "${SCRIPT_DIR}/${path}" checkout --
+    done < <(git -C "$SCRIPT_DIR" submodule status --recursive 2>/dev/null \
+             | sed -n 's/^[ +][0-9a-f]* //p' | sed 's/ (.*)$//')
+}
+
 sync_submodules() {
     # Git submodules (rocksdb, zstd, arrow, isa-l, ...) are cloned by the
     # remote host's network: git is pointed at the SOCKS5 tunnel, so the
@@ -290,6 +334,7 @@ sync_submodules() {
     fi
     if ! grep -q '^-' <<< "$status"; then
         log "Git submodules already initialized"
+        repair_submodules
         return
     fi
 
@@ -314,6 +359,7 @@ sync_submodules() {
     if grep -q '^-' <<< "$status"; then
         die "some submodules are still missing"
     fi
+    repair_submodules
     log "Git submodules are ready"
 }
 
@@ -339,6 +385,49 @@ install_deps() {
             && export all_proxy="$http_proxy" \
             && ./install-deps.sh )
     fi
+}
+
+install_binaries() {
+    [ -f "${BUILD_DIR}/build.ninja" ] \
+        || die "no build tree in ${BUILD_DIR}; run a binary build first"
+    log "Installing binaries to ${INSTALL_PREFIX} (cmake --install)"
+    cmake --install "$BUILD_DIR"
+}
+
+install_asyncssh() {
+    python3 -c 'import asyncssh' 2>/dev/null && return
+    log "python3-asyncssh is not packaged on openEuler; installing it with pip"
+    if python3 -m pip install -q asyncssh; then
+        return
+    fi
+    log "pip through SOCKS failed; downloading asyncssh on ${REMOTE_HOST}"
+    local remote_dir local_dir
+    remote_dir=$(sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" \
+        "${REMOTE_USER}@${REMOTE_HOST}" 'mktemp -d /tmp/asyncssh.XXXXXX')
+    sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+        "python3 -m pip download -q --dest '${remote_dir}' asyncssh"
+    local_dir=$(mktemp -d /tmp/asyncssh-wheels.XXXXXX)
+    sshpass -p "$REMOTE_PASS" scp "${SSH_OPTS[@]}" \
+        "${REMOTE_USER}@${REMOTE_HOST}:${remote_dir}/"* "$local_dir"/
+    python3 -m pip install -q --no-index --find-links "$local_dir" asyncssh
+    sshpass -p "$REMOTE_PASS" ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+        "rm -rf '${remote_dir}'"
+    rm -rf "$local_dir"
+}
+
+install_rpms() {
+    local rpms=()
+    mapfile -t rpms < <(find "${RPM_TOP}/RPMS" -name '*.rpm' 2>/dev/null | sort)
+    [ "${#rpms[@]}" -gt 0 ] \
+        || die "no RPMs under ${RPM_TOP}/RPMS; build them with --rpm first"
+
+    log "Installing runtime dependencies of the Ceph RPMs"
+    dnf_proxy -y install "${RUNTIME_DEPS[@]}"
+    install_asyncssh
+
+    log "Installing ${#rpms[@]} Ceph RPMs from ${RPM_TOP}/RPMS"
+    dnf -y install "${rpms[@]}"
+    log "Ceph RPMs installed"
 }
 
 prepare_cephadm_wheelhouse() {
@@ -375,6 +464,7 @@ configure() {
     log "Configuring Ceph: build type=${BUILD_TYPE}, jobs=${JOBS}, python=${pyver}"
     cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -GNinja \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
         -DCMAKE_C_COMPILER="$cc" \
         -DCMAKE_CXX_COMPILER="$cxx" \
         -DWITH_PYTHON3="$pyver" \
@@ -462,6 +552,12 @@ WGET_EOF
     if grep -q '^%{py3_shebang_fix}' "$spec"; then
         die "failed to patch py3_shebang_fix"
     fi
+    # openEuler does not package python3-asyncssh. It is installed with pip
+    # by install_rpms(), so a hard requirement would make dnf refuse to
+    # install ceph-mgr-cephadm.
+    sed -i 's/^Requires:\([[:space:]]*\)python%{python3_pkgversion}-asyncssh/Recommends:\1python%{python3_pkgversion}-asyncssh/' "$spec"
+    grep -q '^Recommends:.*python%{python3_pkgversion}-asyncssh' "$spec" \
+        || die "failed to patch asyncssh requirement"
     # openEuler's rpm runs brp-python-bytecompile over the whole buildroot
     # (Fedora does not). The spec already byte-compiles sitelib itself, so
     # the extra pass only leaves stray __pycache__ dirs unpackaged.
@@ -489,7 +585,8 @@ WGET_EOF
 summary() {
     local total
     total=$(( $(date +%s) - SCRIPT_START ))
-    if [ "$BUILD_MODE" != "rpm" ] && [ -d "${BUILD_DIR}/bin" ]; then
+    if [ "$BUILD_MODE" != "rpm" ] && [ "$BUILD_MODE" != "install" ] \
+        && [ -d "${BUILD_DIR}/bin" ]; then
         log "Binaries in ${BUILD_DIR}/bin:"
         ls "${BUILD_DIR}/bin" | tr '\n' ' '
         echo
@@ -505,12 +602,18 @@ summary() {
         printf '  子模块   : %-9s %s\n' "$(format_duration "$SUBMODULE_SECONDS")" "$(format_percent "$SUBMODULE_SECONDS" "$total")"
     fi
     printf '  依赖安装 : %-9s %s\n' "$(format_duration "$DEPS_SECONDS")" "$(format_percent "$DEPS_SECONDS" "$total")"
-    if [ "$BUILD_MODE" != "rpm" ]; then
+    if [ "$BUILD_MODE" != "rpm" ] && [ "$BUILD_MODE" != "install" ]; then
         printf '  配置     : %-9s %s\n' "$(format_duration "$CONFIGURE_SECONDS")" "$(format_percent "$CONFIGURE_SECONDS" "$total")"
         printf '  编译     : %-9s %s\n' "$(format_duration "$BUILD_SECONDS")" "$(format_percent "$BUILD_SECONDS" "$total")"
     fi
-    if [ "$BUILD_MODE" != "binary" ]; then
+    if [ "$BUILD_MODE" != "binary" ] && [ "$BUILD_MODE" != "install" ]; then
         printf '  打包     : %-9s %s\n' "$(format_duration "$RPM_SECONDS")" "$(format_percent "$RPM_SECONDS" "$total")"
+    fi
+    if [ "$INSTALL_BIN_SECONDS" -gt 0 ]; then
+        printf '  二进制安装 : %-9s %s\n' "$(format_duration "$INSTALL_BIN_SECONDS")" "$(format_percent "$INSTALL_BIN_SECONDS" "$total")"
+    fi
+    if [ "$INSTALL_SECONDS" -gt 0 ]; then
+        printf '  安装     : %-9s %s\n' "$(format_duration "$INSTALL_SECONDS")" "$(format_percent "$INSTALL_SECONDS" "$total")"
     fi
     printf '  %s\n' "----------------------------------"
     printf '  总计     : %-9s %s\n' "$(format_duration "$total")" "(100.0%)"
@@ -525,7 +628,7 @@ export http_proxy="socks5h://127.0.0.1:${PROXY_PORT}"
 export https_proxy="$http_proxy"
 export all_proxy="$http_proxy"
 
-if [ "$SYNC_SUBMODULES" -eq 1 ]; then
+if [ "$BUILD_MODE" != "install" ] && [ "$SYNC_SUBMODULES" -eq 1 ]; then
     phase_start=$(date +%s)
     sync_submodules
     SUBMODULE_SECONDS=$(( $(date +%s) - phase_start ))
@@ -534,7 +637,7 @@ else
     log "Skipping submodule sync"
 fi
 
-if [ "$SKIP_DEPS" -eq 0 ]; then
+if [ "$BUILD_MODE" != "install" ] && [ "$SKIP_DEPS" -eq 0 ]; then
     phase_start=$(date +%s)
     install_deps
     DEPS_SECONDS=$(( $(date +%s) - phase_start ))
@@ -546,13 +649,13 @@ fi
 if [ "$CLEAN" -eq 1 ]; then
     log "Removing ${BUILD_DIR}"
     rm -rf "$BUILD_DIR"
-    if [ "$BUILD_MODE" != "binary" ]; then
+    if [ "$BUILD_MODE" != "binary" ] && [ "$BUILD_MODE" != "install" ]; then
         log "Removing ${RPM_TOP}"
         rm -rf "$RPM_TOP"
     fi
 fi
 
-if [ "$BUILD_MODE" != "rpm" ]; then
+if [ "$BUILD_MODE" != "rpm" ] && [ "$BUILD_MODE" != "install" ]; then
     prepare_cephadm_wheelhouse
 
     phase_start=$(date +%s)
@@ -566,11 +669,25 @@ if [ "$BUILD_MODE" != "rpm" ]; then
     log "Compilation took $(format_duration "$BUILD_SECONDS")"
 fi
 
-if [ "$BUILD_MODE" != "binary" ]; then
+if [ "$INSTALL_BINARIES" -eq 1 ]; then
+    phase_start=$(date +%s)
+    install_binaries
+    INSTALL_BIN_SECONDS=$(( $(date +%s) - phase_start ))
+    log "Binary installation took $(format_duration "$INSTALL_BIN_SECONDS")"
+fi
+
+if [ "$BUILD_MODE" != "binary" ] && [ "$BUILD_MODE" != "install" ]; then
     phase_start=$(date +%s)
     build_rpms
     RPM_SECONDS=$(( $(date +%s) - phase_start ))
     log "RPM packaging took $(format_duration "$RPM_SECONDS")"
+fi
+
+if [ "$INSTALL_RPMS" -eq 1 ]; then
+    phase_start=$(date +%s)
+    install_rpms
+    INSTALL_SECONDS=$(( $(date +%s) - phase_start ))
+    log "RPM installation took $(format_duration "$INSTALL_SECONDS")"
 fi
 
 summary

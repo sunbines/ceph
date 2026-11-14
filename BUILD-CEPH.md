@@ -7,6 +7,11 @@
 | 二进制编译（默认） | 无 | 用 cmake + ninja 编译出 `build/bin` 下的可执行文件 |
 | RPM 打包 | `--rpm` | 生成源码 tarball 并用 rpmbuild 打出 RPM 包 |
 | 两者都做 | `--both` | 先编译二进制，再打 RPM 包 |
+| 安装 RPM | `--install` | 安装已打好的 RPM 及其运行时依赖（不编译） |
+| 安装二进制 | `--install-binaries` | 编译后执行 `cmake --install` 安装到 `INSTALL_PREFIX`（默认 `/usr/local`） |
+
+加 `--install-rpms` 可在打 RPM 之后自动安装（如 `--rpm --install-rpms`），
+`--install-binaries` 可与 `--rpm`/`--both` 组合，先装二进制再打包。
 
 所有依赖下载（dnf、pip、make-dist 中的源码包）都通过远端主机
 `43.163.78.103` 提供的 SSH SOCKS5 代理完成，不需要本机直连外网。
@@ -45,9 +50,9 @@ export REMOTE_PASS='你的密码'
 
 ```bash
 # 方式二：TOML 配置文件
-# 仓库自带模板 .build-ceph.toml，按需修改即可
-vi .build-ceph.toml
-chmod 600 .build-ceph.toml
+# 仓库自带模板 build-ceph.toml，按需修改即可
+vi build-ceph.toml
+chmod 600 build-ceph.toml
 ```
 
 TOML 模板结构（脚本用 python3 的 `tomllib` 解析，需 Python 3.11+）：
@@ -71,12 +76,12 @@ submodule_jobs = 8
 version = "21.3.0"
 ```
 
-优先级：**命令行参数 > 环境变量 > `.build-ceph.toml` > 脚本默认值**。
+优先级：**命令行参数 > 环境变量 > `build-ceph.toml` > 脚本默认值**。
 仓库中的模板不含真实凭据；本地填入密码后，可用下面的命令让 git
 忽略该文件的改动：
 
 ```bash
-git update-index --skip-worktree .build-ceph.toml
+git update-index --skip-worktree build-ceph.toml
 ```
 
 也可以用 `CONFIG_FILE=/path/to/other.toml` 指定其他配置文件。
@@ -96,6 +101,18 @@ cd /root/ceph
 
 # 3) 二进制 + RPM
 ./build-ceph.sh --both
+
+# 4) 打 RPM 并直接安装（含运行时依赖）
+./build-ceph.sh --rpm --install-rpms
+
+# 5) 安装之前已打好的 RPM
+./build-ceph.sh --install
+
+# 6) 编译并安装二进制到 /usr/local（默认前缀）
+./build-ceph.sh --install-binaries
+
+# 7) 指定安装前缀
+INSTALL_PREFIX=/opt/ceph ./build-ceph.sh --install-binaries
 ```
 
 需要 root 权限（安装依赖、写系统目录），非 root 用户请用 `sudo`。
@@ -121,6 +138,9 @@ cd /root/ceph
 | --- | --- |
 | `--rpm` | RPM 打包模式 |
 | `--both` | 二进制 + RPM |
+| `--install` | 安装 `build-rpms/RPMS` 下已打好的 RPM，并自动补齐运行时依赖 |
+| `--install-rpms` | 打包完成后立即安装（可与 `--rpm`/`--both` 组合） |
+| `--install-binaries` | 编译（必要时）后执行 `cmake --install`，把二进制安装到 `INSTALL_PREFIX`；别名 `--install-bin` |
 | `--rpm-version VERSION` | RPM 版本号，默认 `21.3.0`。可写成 `21.3.0-1`（`-` 后为 release），也支持环境变量 `RPM_VERSION` |
 | `--clean` | 启动前删除 `build/`（以及非纯二进制模式下的 `build-rpms/`） |
 | `--skip-deps` | 跳过依赖安装 |
@@ -137,10 +157,12 @@ cd /root/ceph
 REMOTE_HOST REMOTE_USER REMOTE_PASS PROXY_PORT
 BUILD_DIR LOG_DIR RPM_TOP RPM_VERSION JOBS BUILD_TYPE
 WITH_TESTS WITH_PARQUET SYNC_SUBMODULES SUBMODULE_JOBS
+INSTALL_PREFIX
 ```
 
 `SYNC_SUBMODULES=0` 等价于 `--skip-submodules`；`SUBMODULE_JOBS` 是
-子模块并行下载数（默认 8）。
+子模块并行下载数（默认 8）；`INSTALL_PREFIX` 是二进制安装前缀
+（默认 `/usr/local`，同时作为 CMake 的 `CMAKE_INSTALL_PREFIX`）。
 
 其中 `REMOTE_PASS` 必填；脚本不会在命令行参数里接受密码。
 
@@ -160,15 +182,19 @@ REMOTE_HOST=10.0.0.5 REMOTE_USER=ops REMOTE_PASS=secret ./build-ceph.sh --rpm
    子模块（rocksdb、zstd、arrow、isa-l 等），然后执行
    `git submodule sync/update --init --recursive`。git 走上面的 SOCKS5 隧道，
    即由 `43.163.78.103` 访问 GitHub 并把对象经 SSH 隧道回传到运行脚本的
-   构建机（如 `192.168.1.3`），本机无需直连外网。已初始化的子模块直接跳过；
-   `--skip-submodules` 可关闭此步骤。
+   构建机（如 `192.168.1.3`），本机无需直连外网。已初始化的子模块直接跳过，
+   但会检查其工作区是否缺少跟踪文件（例如中断的 checkout 留下的空目录），
+   缺失时从本地对象库自动恢复；`--skip-submodules` 可关闭此步骤。
 3. **安装依赖**：openEuler 上用 `dnf builddep` 解析 `ceph.spec.in` 安装依赖；
    `libnbd-devel` 在 openEuler 源里没有，脚本会在远端（CentOS Stream 9）
    执行 `dnf download --resolve` 再 `scp` 回来安装。
 4. **二进制模式**：
    - 准备 cephadm 的离线 wheelhouse（`.cache/cephadm-wheelhouse/`），
      避免临时 venv 中的 pip 无法走 SOCKS 代理；
-   - `cmake -GNinja` 配置，`ninja` 编译。
+   - `cmake -GNinja` 配置（`CMAKE_INSTALL_PREFIX=${INSTALL_PREFIX}`），
+     `ninja` 编译；
+   - 指定 `--install-binaries` 时执行 `cmake --install build`，把可执行文件、
+     库、头文件等安装到 `INSTALL_PREFIX`（默认 `/usr/local`）。
 5. **RPM 模式**：
    - 用仓库自带 `make-dist` 生成 `ceph-<版本>.tar.bz2`：
      - 通过一个 `wget -> curl` 的 shim 走代理下载 boost / liburing / pmdk；
@@ -183,8 +209,19 @@ REMOTE_HOST=10.0.0.5 REMOTE_USER=ops REMOTE_PASS=secret ./build-ceph.sh --rpm
        `__pycache__`（spec 自己会对 sitelib 做字节编译）；
      - 将仅由 `ceph-test` 子包收录的 `ceph_ec_consistency_checker`
        从主包中排除（因为我们关闭了 `ceph_test_package`）；
+     - openEuler 不提供 `python3-asyncssh`，把 `ceph-mgr-cephadm` 对它的
+       硬依赖降为 `Recommends`（运行时由脚本用 pip 安装 asyncssh）；
    - 执行 `rpmbuild -ba`，并关闭：`crimson`、`ceph_test_package`、
      `dwz`、`cephadm_bundling`。
+6. **安装 RPM**（`--install` / `--install-rpms`）：
+   - 先用 `dnf` 安装 openEuler 源里存在的运行时依赖：`luarocks`、
+     `python3-cherrypy`、`python3-natsort`、`python3-pyOpenSSL`、
+     `python3-routes`、`python3-numpy`、`python3-scikit-learn`、
+     `python3-scipy`、`python3-kubernetes`、`python3-jsonpatch`、
+     `resource-agents`；
+   - `python3-asyncssh` 不在 openEuler 源中，通过 pip 安装（走 SOCKS 代理，
+     失败时改由远端主机下载 wheel 再回传）；
+   - 最后 `dnf install build-rpms/RPMS/x86_64/*.rpm` 安装全部 Ceph RPM。
 
 源码 tarball 生成一次后会保留在 `build-rpms/SOURCES/`，后续打包直接复用；
 要重新生成请加 `--clean`。
@@ -210,10 +247,25 @@ build/bin/ceph --version
 build/bin/rbd --version
 ```
 
-安装 RPM（示例）：
+安装二进制：
 
 ```bash
-dnf install ./build-rpms/RPMS/x86_64/*.rpm
+./build-ceph.sh --install-binaries                 # 默认装到 /usr/local
+INSTALL_PREFIX=/opt/ceph ./build-ceph.sh --install-binaries
+```
+
+安装 RPM：
+
+```bash
+# 推荐：脚本自动补齐运行时依赖（含 pip 安装 asyncssh）
+./build-ceph.sh --install
+
+# 等价的手工步骤（先装依赖，再装包）
+dnf install -y luarocks python3-cherrypy python3-natsort python3-pyOpenSSL \
+    python3-routes python3-numpy python3-scikit-learn python3-scipy \
+    python3-kubernetes python3-jsonpatch resource-agents
+python3 -m pip install asyncssh
+dnf install -y ./build-rpms/RPMS/x86_64/*.rpm
 ```
 
 ---
@@ -234,7 +286,9 @@ dnf install ./build-rpms/RPMS/x86_64/*.rpm
 ```
 
 “子模块”行只在本次确实下载了子模块（耗时大于 0）时显示；
-纯二进制模式不显示“打包”行，纯 RPM 模式不显示“配置/编译”行，
+纯二进制模式不显示“打包”行，纯 RPM / `--install` 模式不显示“配置/编译”行，
+“二进制安装”行只在执行 `--install-binaries` 时显示，
+“安装”行只在执行 RPM 安装时显示，
 “依赖安装”用 `--skip-deps` 跳过时显示 `0s`。
 
 ---
@@ -254,6 +308,25 @@ dnf install ./build-rpms/RPMS/x86_64/*.rpm
 ---
 
 ## 9. 常见问题
+
+**安装 RPM 时报缺少 python3-cherrypy / luarocks / resource-agents 等依赖**
+
+直接运行 `./build-ceph.sh --install`，脚本会用 `dnf` 安装这些运行时依赖，
+并用 pip 安装 openEuler 源里没有的 `python3-asyncssh`，然后再安装
+`build-rpms/RPMS/x86_64/*.rpm`。注意 `python3-asyncssh` 降级为
+`Recommends` 的 spec 修改只对本次构建生成的 RPM 生效；旧 RPM 请重新
+执行一次 `--rpm`。
+
+**两个终端同时执行脚本**
+
+脚本会对 `build-logs/build.lock` 加 `flock`，第二个进程会直接报错退出。
+请等前一个任务结束（或确认没有 `build-ceph.sh`/`ninja` 进程）后再执行。
+
+**编译时报 `file STRINGS ... src/rocksdb/include/rocksdb/version.h cannot be read`**
+
+说明 rocksdb 子模块目录被清空了。脚本启动时会自动检测并恢复缺失的
+跟踪文件；若仍未解决，可手动执行
+`git submodule update --init --recursive -- src/rocksdb` 后重跑。
 
 **代理起不来 / 端口被占用**
 
